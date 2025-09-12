@@ -29,6 +29,7 @@
 
 #include <map>
 #include <pthread.h>
+#include <type_traits>
 #include <vector>
 
 #include "CallGraph.h"
@@ -46,7 +47,134 @@ int CallGraphPass::AnalysisPhase = 1;
 // Implementation
 //
 
-bool CallGraphPass::doInitialization(Module *M) {
+void checkMemoryRelatedInsts(Function *F, Module *M) {
+  for (inst_iterator i = inst_begin(F), e = inst_end(F); i != e; ++i) {
+    Instruction *I = &*i;
+    bool ifMemCopy = false;
+    if (CallInst *CI = dyn_cast<CallInst>(I)) {
+      Function *F = CI->getCalledFunction();
+      if (!F)
+        continue; //direct call
+
+      // Detect the existence of these functions
+      // --- Memory copy function detection example ---
+      static const std::set<std::string> MemCopyFuncNames = {
+          "memcpy",
+          "memmove",
+          "memcpy_and_pad",
+          "copy_kernel_nofault",
+          "copy_to_kernel_nofault",
+          "probe_kernel_read",
+          "probe_kernel_write",
+          "copy_page",
+          "memcpy_from_page",
+          "memcpy_to_page",
+          "folio_copy"
+          // Add more variants as needed
+      };
+
+      StringRef FName = F->getName();
+      // Direct name match
+
+      if (MemCopyFuncNames.count(FName.str()) > 0) {
+        OP << "[MemCopy] Found: " << FName << "\n";
+        ifMemCopy = true;
+      }
+      // Fuzzy match for variants
+      if (FName.contains("memcpy")) {
+        OP << "[MemCopy Variant] Found: " << FName << "\n";
+        ifMemCopy = true;
+      }
+      // LLVM intrinsic check
+      if (F->isIntrinsic()) {
+        auto IID = F->getIntrinsicID();
+        if (IID == Intrinsic::memcpy || IID == Intrinsic::memmove) {
+          OP << "[LLVM Intrinsic MemCopy] Found: " << FName << "\n";
+          ifMemCopy = true;
+        }
+      }
+    }
+
+
+
+    if(ifMemCopy) {
+      OP << "\n\n-------- [MemCopy] Found memory copy instruction: --------" <<"\n" <<  *I << "\n";
+
+      // Print source code information for memory copy instruction
+      if (DILocation *Loc = I->getDebugLoc()) {
+        OP << "Source location: " << Loc->getFilename() << ":" << Loc->getLine() << ":" << Loc->getColumn() << "\n";
+        if (DISubprogram *SP = Loc->getScope()->getSubprogram()) {
+          OP << "Function: " << SP->getName() << "\n";
+        }
+      } else {
+        OP << "No debug location available\n";
+      }
+        CallInst *memCopyCall = dyn_cast<CallInst>(I);
+      if (memCopyCall && memCopyCall->getNumOperands() >= 2) {
+        // Get first two parameters (dest and src)
+        Value *dest = memCopyCall->getOperand(0);
+        Value *src = memCopyCall->getOperand(1);
+         OP << "What is dest and src?" << *dest << " , " << *src << "\n";
+        // Trace back one layer to find definitions and check types
+        auto traceParameterType = [](Value *param, const std::string &paramName) -> Type* {
+          if (Instruction *defInst = dyn_cast<Instruction>(param)) {
+            OP << "[" << paramName << "] Defined by: " << *defInst << "\n";
+            OP << "[" << paramName << "] Type: " << *param->getType() << "\n";
+            
+            // Check if it's a cast instruction
+            if (CastInst *castInst = dyn_cast<CastInst>(defInst)) {
+              Value *srcValue = castInst->getOperand(0);
+              OP << "[" << paramName << "] Cast source type: " << *srcValue->getType() << "\n";
+              return srcValue->getType();
+            }
+            // Check if it's a load instruction
+            else if (LoadInst *loadInst = dyn_cast<LoadInst>(defInst)) {
+              Value *ptr = loadInst->getPointerOperand();
+              OP << "[" << paramName << "] Loaded from type: " << *ptr->getType() << "\n";
+              return ptr->getType();
+            }
+            // Check if it's a GEP instruction
+            else if (GetElementPtrInst *gepInst = dyn_cast<GetElementPtrInst>(defInst)) {
+              OP << "[" << paramName << "] GEP source type: " << *gepInst->getSourceElementType() << "\n";
+              return gepInst->getSourceElementType();
+            }
+          } else if (Argument *arg = dyn_cast<Argument>(param)) {
+            OP << "[" << paramName << "] Function argument type: " << *param->getType() << "\n";
+            return param->getType();
+          } else {
+            OP << "[" << paramName << "] Other value type: " << *param->getType() << "\n";
+            return param->getType();
+          }
+          return nullptr;
+        };
+        
+
+        Type* destType=traceParameterType(dest, "Dest");
+        Type* srcType=traceParameterType(src, "Src");
+
+
+        if(destType && srcType && destType->isStructTy() && srcType->isStructTy()) {
+           OP << "[Struct Types] Both dest and src are struct types:\n";
+        }
+        // Check if dest and src types are different and both are aggregate types
+        if (destType && srcType && destType != srcType) {
+          OP << "[Type Mismatch] Non-aggregate Different types detected\n";
+          if (destType->isAggregateType() && srcType->isAggregateType()) {
+            OP << "[Type Mismatch] Different aggregate types detected:\n";
+            OP << "  Dest type: " << *destType << "\n";
+            OP << "  Src type: " << *srcType << "\n";
+          }
+        }
+
+
+      }
+    }
+  }
+
+
+}
+
+  bool CallGraphPass::doInitialization(Module * M) {
 
     OP << "#" << MIdx << " Initializing: " << M->getName() << "\n";
 
@@ -66,7 +194,7 @@ bool CallGraphPass::doInitialization(Module *M) {
       for (auto MN : Ctx->Modules) {
         Module *M = MN.first;
         for (Module::global_iterator gi = M->global_begin();
-            gi != M->global_end(); ++gi) {
+             gi != M->global_end(); ++gi) {
 
           GlobalVariable *GV = &*gi;
           if (GV->hasInitializer()) {
@@ -76,246 +204,216 @@ bool CallGraphPass::doInitialization(Module *M) {
       }
     }
 
-  //
-  // Iterate and process globals
-  //
-  for (Module::global_iterator gi = M->global_begin(); gi != M->global_end();
-       ++gi) {
+    //
+    // Iterate and process globals
+    //
+    for (Module::global_iterator gi = M->global_begin(); gi != M->global_end();
+         ++gi) {
 
-    GlobalVariable *GV = &*gi;
-    if (GV->hasInitializer()) {
+      GlobalVariable *GV = &*gi;
+      if (GV->hasInitializer()) {
 
-      Type *ITy = GV->getInitializer()->getType();
-      if (!ITy->isPointerTy() && !isContainerTy(ITy))
-        continue;
+        Type *ITy = GV->getInitializer()->getType();
+        if (!ITy->isPointerTy() && !isContainerTy(ITy))
+          continue;
 
-      // Ctx->Globals[GV->getGUID()] = GV;
+        // Ctx->Globals[GV->getGUID()] = GV;
 
-      // Parse the initializer
-      set<Type *> TySet;
-      findTargetTypesInInitializer(GV, M, TySet);
+        // Parse the initializer
+        set<Type *> TySet;
+        findTargetTypesInInitializer(GV, M, TySet);
 
-      typeConfineInInitializer(GV);
+        typeConfineInInitializer(GV);
 
-      // Collect all casts in the global variable
-      findCastsInGV(GV, CastSet);
-    }
-  }
-
-  // Iterate functions and instructions
-  for (Function &F : *M) {
-  // Detect the existence of these functions
-  // --- Memory copy function detection example ---
-  static const std::set<std::string> MemCopyFuncNames = {
-    "memcpy", "memmove", "memcpy_and_pad", "copy_kernel_nofault",
-    "copy_to_kernel_nofault", "probe_kernel_read", "probe_kernel_write",
-    "copy_page", "memcpy_from_page", "memcpy_to_page", "folio_copy"
-    // Add more variants as needed
-  };
-
-  StringRef FName = F.getName();
-  // Direct name match
-  if (MemCopyFuncNames.count(FName.str()) > 0) {
-    OP << "[MemCopy] Found: " << FName << "\n";
-  }
-  // Fuzzy match for variants
-  if (FName.contains("memcpy")) {
-    OP << "[MemCopy Variant] Found: " << FName << "\n";
-  }
-  // LLVM intrinsic check
-  if (F.isIntrinsic()) {
-    auto IID = F.getIntrinsicID();
-    if (IID == Intrinsic::memcpy || IID == Intrinsic::memmove) {
-      OP << "[LLVM Intrinsic MemCopy] Found: " << FName << "\n";
-    }
-  }
-
-    // Find the parameter of these functions
-
-    // get the source type of the parameters
-
-
-
-    // Do not include LLVM intrinsic functions?
-    if (F.isIntrinsic()) {
-      continue;
-    }
-
-    // Collect address-taken functions.
-    // NOTE: declaration functions can also have address taken
-    if (F.hasAddressTaken()) {
-      Ctx->AddressTakenFuncs.insert(&F);
-      size_t FuncHash = funcHash(&F, false);
-      Ctx->sigFuncsMap[FuncHash].insert(&F);
-      StringRef FName = F.getName();
-      // The following functions are not in the analysis scope
-      if (FName.startswith("__x64") || FName.startswith("__ia32") ||
-          FName.startswith("__do_sys")) {
-        OutScopeFuncNames.insert(F.getName().str());
+        // Collect all casts in the global variable
+        findCastsInGV(GV, CastSet);
       }
     }
 
-    // The following only considers actual functions with body
-    if (F.isDeclaration()) {
-      continue;
-    }
-    ++Ctx->NumFunctions;
+    // Iterate functions and instructions
+    for (Function &F : *M) {
 
-    // Collect global function definitions.
-    if (F.hasExternalLinkage()) {
-      Ctx->GlobalFuncMap[F.getGUID()] = &F;
-    }
+      // Find the parameter of these functions
 
-    //
-    // MLTA and TyPM
-    //
-    if (ENABLE_MLTA > 1) {
-      typePropInFunction(&F);
-    }
+      // get the source type of the parameters
 
-    collectAliasStructPtr(&F);
-    typeConfineInFunction(&F);
+      // Do not include LLVM intrinsic functions?
+      if (F.isIntrinsic()) {
+        continue;
+      }
 
-    // Collect all casts in the function
-    findCastsInFunction(&F, CastSet);
-
-    // Handle casts
-    processCasts(CastSet, M);
-
-    // Collect all stores against fields of composite types in the
-    // function
-    findStoredTypeIdxInFunction(&F);
-
-    // Collection allocations of critical data structures
-    findTargetAllocInFunction(&F);
-  }
-
-  //
-  // Do something at the end of last module
-  //
-  if (Ctx->Modules.size() == MIdx) {
-
-    if (ENABLE_MLTA > 1) {
-      // Map the declaration functions to actual ones
-      // NOTE: to delete an item, must iterate by reference
-      for (auto &SF : Ctx->sigFuncsMap) {
-        for (auto F : SF.second) {
-          if (!F)
-            continue;
-          if (F->isDeclaration()) {
-            SF.second.erase(F);
-            if (Function *AF = Ctx->GlobalFuncMap[F->getGUID()]) {
-              SF.second.insert(AF);
-            }
-          }
+      // Collect address-taken functions.
+      // NOTE: declaration functions can also have address taken
+      if (F.hasAddressTaken()) {
+        Ctx->AddressTakenFuncs.insert(&F);
+        size_t FuncHash = funcHash(&F, false);
+        Ctx->sigFuncsMap[FuncHash].insert(&F);
+        StringRef FName = F.getName();
+        // The following functions are not in the analysis scope
+        if (FName.startswith("__x64") || FName.startswith("__ia32") ||
+            FName.startswith("__do_sys")) {
+          OutScopeFuncNames.insert(F.getName().str());
         }
       }
 
-      for (auto &TF : typeIdxFuncsMap) {
-        for (auto &IF : TF.second) {
-          for (auto F : IF.second) {
+      // The following only considers actual functions with body
+      if (F.isDeclaration()) {
+        continue;
+      }
+      ++Ctx->NumFunctions;
+
+      // Collect global function definitions.
+      if (F.hasExternalLinkage()) {
+        Ctx->GlobalFuncMap[F.getGUID()] = &F;
+      }
+
+      checkMemoryRelatedInsts(&F, M);
+      //
+      // MLTA and TyPM
+      //
+      if (ENABLE_MLTA > 1) {
+        typePropInFunction(&F);
+      }
+
+      collectAliasStructPtr(&F);
+      typeConfineInFunction(&F);
+
+      // Collect all casts in the function
+      findCastsInFunction(&F, CastSet);
+
+      // Handle casts
+      processCasts(CastSet, M);
+
+      // Collect all stores against fields of composite types in the
+      // function
+      findStoredTypeIdxInFunction(&F);
+
+      // Collection allocations of critical data structures
+      findTargetAllocInFunction(&F);
+    }
+
+    //
+    // Do something at the end of last module
+    //
+    if (Ctx->Modules.size() == MIdx) {
+
+      if (ENABLE_MLTA > 1) {
+        // Map the declaration functions to actual ones
+        // NOTE: to delete an item, must iterate by reference
+        for (auto &SF : Ctx->sigFuncsMap) {
+          for (auto F : SF.second) {
+            if (!F)
+              continue;
             if (F->isDeclaration()) {
-              IF.second.erase(F);
+              SF.second.erase(F);
               if (Function *AF = Ctx->GlobalFuncMap[F->getGUID()]) {
-                IF.second.insert(AF);
+                SF.second.insert(AF);
+              }
+            }
+          }
+        }
+
+        for (auto &TF : typeIdxFuncsMap) {
+          for (auto &IF : TF.second) {
+            for (auto F : IF.second) {
+              if (F->isDeclaration()) {
+                IF.second.erase(F);
+                if (Function *AF = Ctx->GlobalFuncMap[F->getGUID()]) {
+                  IF.second.insert(AF);
+                }
               }
             }
           }
         }
       }
+
+      MIdx = 0;
     }
 
-    MIdx = 0;
+    return false;
   }
 
-  return false;
-}
+  // unused code in clean mode
+  void CallGraphPass::PhaseMLTA(Function * F) {
 
-
-
-
-
-// unused code in clean mode
-void CallGraphPass::PhaseMLTA(Function *F) {
-
-  // Unroll loops
+    // Unroll loops
 #ifdef UNROLL_LOOP_ONCE
-  unrollLoops(F);
+    unrollLoops(F);
 #endif
 
-  // Collect callers and callees
-  for (inst_iterator i = inst_begin(F), e = inst_end(F); i != e; ++i) {
-    // Map callsite to possible callees.
-    if (CallInst *CI = dyn_cast<CallInst>(&*i)) {
+    // Collect callers and callees
+    for (inst_iterator i = inst_begin(F), e = inst_end(F); i != e; ++i) {
+      // Map callsite to possible callees.
+      if (CallInst *CI = dyn_cast<CallInst>(&*i)) {
 
-      CallSet.insert(CI);
+        CallSet.insert(CI);
 
-      FuncSet *FS = &Ctx->Callees[CI];
-      Value *CV = CI->getCalledOperand();
-      Function *CF = dyn_cast<Function>(CV);
+        FuncSet *FS = &Ctx->Callees[CI];
+        Value *CV = CI->getCalledOperand();
+        Function *CF = dyn_cast<Function>(CV);
 
-      // Indirect call
-      if (CI->isIndirectCall()) {
+        // Indirect call
+        if (CI->isIndirectCall()) {
 
-        // Multi-layer type matching
-        if (ENABLE_MLTA > 1) {
-          findCalleesWithMLTA(CI, *FS);
-        }
-        // Fuzzy type matching
-        else if (ENABLE_MLTA == 0) {
-          size_t CIH = callHash(CI);
-          if (MatchedICallTypeMap.find(CIH) != MatchedICallTypeMap.end())
-            *FS = MatchedICallTypeMap[CIH];
+          // Multi-layer type matching
+          if (ENABLE_MLTA > 1) {
+            findCalleesWithMLTA(CI, *FS);
+          }
+          // Fuzzy type matching
+          else if (ENABLE_MLTA == 0) {
+            size_t CIH = callHash(CI);
+            if (MatchedICallTypeMap.find(CIH) != MatchedICallTypeMap.end())
+              *FS = MatchedICallTypeMap[CIH];
+            else {
+              findCalleesWithType(CI, *FS);
+              MatchedICallTypeMap[CIH] = *FS;
+            }
+          }
+          // One-layer type matching
           else {
-            findCalleesWithType(CI, *FS);
-            MatchedICallTypeMap[CIH] = *FS;
-          }
-        }
-        // One-layer type matching
-        else {
-          *FS = Ctx->sigFuncsMap[callHash(CI)];
-        }
-
-#ifdef MAP_CALLER_TO_CALLEE
-        for (Function *Callee : *FS) {
-          Ctx->Callers[Callee].insert(CI);
-        }
-#endif
-
-        // Save called values for future uses.
-        Ctx->IndirectCallInsts.push_back(CI);
-
-        ICallSet.insert(CI);
-        if (!FS->empty()) {
-          MatchedICallSet.insert(CI);
-          Ctx->NumIndirectCallTargets += FS->size();
-          Ctx->NumValidIndirectCalls++;
-        }
-      }
-      // Direct call
-      else {
-        // not InlineAsm
-        if (CF) {
-          // Call external functions
-          if (CF->isDeclaration()) {
-            // StringRef FName = CF->getName();
-            // if (FName.startswith("SyS_"))
-            //	FName = StringRef("sys_" + FName.str().substr(4));
-            if (Function *GF = Ctx->GlobalFuncMap[CF->getGUID()])
-              CF = GF;
+            *FS = Ctx->sigFuncsMap[callHash(CI)];
           }
 
-          FS->insert(CF);
+#ifdef MAP_CALLER_TO_CALLEE
+          for (Function *Callee : *FS) {
+            Ctx->Callers[Callee].insert(CI);
+          }
+#endif
+
+          // Save called values for future uses.
+          Ctx->IndirectCallInsts.push_back(CI);
+
+          ICallSet.insert(CI);
+          if (!FS->empty()) {
+            MatchedICallSet.insert(CI);
+            Ctx->NumIndirectCallTargets += FS->size();
+            Ctx->NumValidIndirectCalls++;
+          }
+        }
+        // Direct call
+        else {
+          // not InlineAsm
+          if (CF) {
+            // Call external functions
+            if (CF->isDeclaration()) {
+              // StringRef FName = CF->getName();
+              // if (FName.startswith("SyS_"))
+              //	FName = StringRef("sys_" + FName.str().substr(4));
+              if (Function *GF = Ctx->GlobalFuncMap[CF->getGUID()])
+                CF = GF;
+            }
+
+            FS->insert(CF);
 
 #ifdef MAP_CALLER_TO_CALLEE
-          Ctx->Callers[CF].insert(CI);
+            Ctx->Callers[CF].insert(CI);
 #endif
+          }
+          // InlineAsm
+          else {
+            // TODO: handle InlineAsm functions
+          }
         }
-        // InlineAsm
-        else {
-          // TODO: handle InlineAsm functions
-        }
-      }
 #if 0
 			if (ENABLE_MLTA > 1) {
 				if (CI->isIndirectCall()) {
@@ -348,35 +446,65 @@ void CallGraphPass::PhaseMLTA(Function *F) {
 				}
 				}
 #endif
+      }
     }
   }
-}
 
-void CallGraphPass::PhaseTyPM(Function *F) {
-  for (inst_iterator i = inst_begin(F), e = inst_end(F); i != e; ++i) {
+  void CallGraphPass::PhaseTyPM(Function * F) {
+    for (inst_iterator i = inst_begin(F), e = inst_end(F); i != e; ++i) {
 
-    //
-    // Step 1: Collect data flows among modules
-    //
+      //
+      // Step 1: Collect data flows among modules
+      //
 
-    // Note: the following impl is not type-aware yet
-    // Collect data flows through functions calls
-    CallInst *CI = dyn_cast<CallInst>(&*i);
-    if (!CI)
-      continue;
+      // Note: the following impl is not type-aware yet
+      // Collect data flows through functions calls
+      CallInst *CI = dyn_cast<CallInst>(&*i);
+      if (!CI)
+        continue;
 
-    if (CI->arg_empty())
-      continue;
+      if (CI->arg_empty())
+        continue;
 
-    // Indirect call
-    if (CI->isIndirectCall()) {
+      // Indirect call
+      if (CI->isIndirectCall()) {
 
-      for (auto CF : Ctx->Callees[CI]) {
-        // Need to use the actual function with body here
-        if (CF->isDeclaration())
-          CF = Ctx->GlobalFuncMap[CF->getGUID()];
-        if (!CF) {
+        for (auto CF : Ctx->Callees[CI]) {
+          // Need to use the actual function with body here
+          if (CF->isDeclaration())
+            CF = Ctx->GlobalFuncMap[CF->getGUID()];
+          if (!CF) {
+            continue;
+          }
+          if (CF->doesNotAccessMemory())
+            continue;
+
+          parseTargetTypesInCalls(CI, CF);
+        }
+      }
+
+      // Direct call, no need to repeat for following iterations
+      else if (AnalysisPhase == 2) {
+        // NOTE: Do not use getCalledFunction as it can only return
+        // function within the module
+        Value *CO = CI->getCalledOperand();
+        if (!CO) {
           continue;
+        }
+
+        Function *CF = dyn_cast<Function>(CO);
+        if (!CF || CF->isIntrinsic()) {
+          // Likely it is ASM code
+          continue;
+        }
+        // Need to use the actual function with body here
+        if (CF->isDeclaration()) {
+          CF = Ctx->GlobalFuncMap[CF->getGUID()];
+          if (!CF) {
+            // Have to skip it as the function body is not in
+            // the analysis scope
+            continue;
+          }
         }
         if (CF->doesNotAccessMemory())
           continue;
@@ -384,52 +512,22 @@ void CallGraphPass::PhaseTyPM(Function *F) {
         parseTargetTypesInCalls(CI, CF);
       }
     }
+  }
+  bool CallGraphPass::doFinalization(Module * M) {
 
-    // Direct call, no need to repeat for following iterations
-    else if (AnalysisPhase == 2) {
-      // NOTE: Do not use getCalledFunction as it can only return
-      // function within the module
-      Value *CO = CI->getCalledOperand();
-      if (!CO) {
-        continue;
-      }
+    ++MIdx;
+    if (Ctx->Modules.size() == MIdx) {
+      // Finally map declaration functions to actual functions
+      OP << "Mapping declaration functions to actual ones...\n";
+      Ctx->NumIndirectCallTargets = 0;
+      for (auto CI : CallSet) {
+        mapDeclToActualFuncs(Ctx->Callees[CI]);
 
-      Function *CF = dyn_cast<Function>(CO);
-      if (!CF || CF->isIntrinsic()) {
-        // Likely it is ASM code
-        continue;
-      }
-      // Need to use the actual function with body here
-      if (CF->isDeclaration()) {
-        CF = Ctx->GlobalFuncMap[CF->getGUID()];
-        if (!CF) {
-          // Have to skip it as the function body is not in
-          // the analysis scope
-          continue;
+        if (CI->isIndirectCall()) {
+          Ctx->NumIndirectCallTargets += Ctx->Callees[CI].size();
+          printTargets(Ctx->Callees[CI], CI);
         }
       }
-      if (CF->doesNotAccessMemory())
-        continue;
-
-      parseTargetTypesInCalls(CI, CF);
-    }
-  }
-}
-bool CallGraphPass::doFinalization(Module *M) {
-
-  ++MIdx;
-  if (Ctx->Modules.size() == MIdx) {
-    // Finally map declaration functions to actual functions
-    OP << "Mapping declaration functions to actual ones...\n";
-    Ctx->NumIndirectCallTargets = 0;
-    for (auto CI : CallSet) {
-      mapDeclToActualFuncs(Ctx->Callees[CI]);
-
-      if (CI->isIndirectCall()) {
-        Ctx->NumIndirectCallTargets += Ctx->Callees[CI].size();
-        printTargets(Ctx->Callees[CI], CI);
-      }
-    }
 
 #if 0
 			for (auto Prop : moPropMap) {
@@ -437,65 +535,65 @@ bool CallGraphPass::doFinalization(Module *M) {
 					OP<<"\t"<<Mo->getName()<<"\n\n";
 			}
 #endif
+    }
+    return false;
   }
-  return false;
-}
 
-bool CallGraphPass::doModulePass(Module *M) {
+  bool CallGraphPass::doModulePass(Module * M) {
 
-  ++MIdx;
+    ++MIdx;
 
-  //
-  // Iterate and process globals
-  //
-  for (Module::global_iterator gi = M->global_begin(); gi != M->global_end();
-       ++gi) {
+    //
+    // Iterate and process globals
+    //
+    for (Module::global_iterator gi = M->global_begin(); gi != M->global_end();
+         ++gi) {
 
-    GlobalVariable *GV = &*gi;
+      GlobalVariable *GV = &*gi;
 
-    Type *GTy = GV->getType();
-    assert(GTy->isPointerTy());
+      Type *GTy = GV->getType();
+      assert(GTy->isPointerTy());
 
-    if (AnalysisPhase == 1) {
+      if (AnalysisPhase == 1) {
 
 #ifdef PARSE_VALUE_USES
-      // Parse its uses
-      set<Value *> Visited;
-      parseUsesOfGV(GV, GV, M, Visited);
+        // Parse its uses
+        set<Value *> Visited;
+        parseUsesOfGV(GV, GV, M, Visited);
 
 #else
 
-      if (!GV->hasInitializer()) {
-        GV = Ctx->Globals[GV->getGUID()];
-        if (!GV) {
-          continue;
+        if (!GV->hasInitializer()) {
+          GV = Ctx->Globals[GV->getGUID()];
+          if (!GV) {
+            continue;
+          }
         }
-      }
 
-      set<Type *> TySet;
-      findTargetTypesInValue(GV->getInitializer(), TySet, M);
-      for (auto Ty : TySet) {
+        set<Type *> TySet;
+        findTargetTypesInValue(GV->getInitializer(), TySet, M);
+        for (auto Ty : TySet) {
 
-        // TODO: can be optimized for better precision: either from
-        // or to
-        size_t TyH;
-        TypesFromModuleGVMap[make_pair(GV->getGUID(), TyH)].insert(M);
-        TypesToModuleGVMap[make_pair(GV->getGUID(), TyH)].insert(M);
-      }
+          // TODO: can be optimized for better precision: either from
+          // or to
+          size_t TyH;
+          TypesFromModuleGVMap[make_pair(GV->getGUID(), TyH)].insert(M);
+          TypesToModuleGVMap[make_pair(GV->getGUID(), TyH)].insert(M);
+        }
 
 #endif
-    }
-  }
-  if (MIdx == Ctx->Modules.size()) {
-    // Use globals to connect modules
-    for (auto GMM : TypesToModuleGVMap) {
-      for (auto DstM : GMM.second) {
-        size_t TyH = GMM.first.second;
-        moPropMap[make_pair(DstM, TyH)].insert(
-            TypesFromModuleGVMap[GMM.first].begin(),
-            TypesFromModuleGVMap[GMM.first].end());
       }
     }
+    if (MIdx == Ctx->Modules.size()) {
+      // Use globals to connect modules
+      for (auto GMM : TypesToModuleGVMap) {
+        for (auto DstM : GMM.second) {
+          size_t TyH = GMM.first.second;
+          moPropMap[make_pair(DstM, TyH)].insert(
+              TypesFromModuleGVMap[GMM.first].begin(),
+              TypesFromModuleGVMap[GMM.first].end());
+        }
+      }
 #if 0
 			for (auto m : moPropMap)
 				for (auto m1 : m.second)
@@ -503,120 +601,121 @@ bool CallGraphPass::doModulePass(Module *M) {
 						<<" ==> "<<m.first.first->getName()
 						<<" HASH: "<<m.first.second<<"\n";
 #endif
-  }
-
-  //
-  // Process functions
-  //
-  for (Module::iterator f = M->begin(), fe = M->end(); f != fe; ++f) {
-
-    Function *F = &*f;
-
-    if (F->isDeclaration() || F->isIntrinsic())
-      continue;
-
-    // Phase 1: Multi-layer type analysis
-    if (AnalysisPhase == 1) {
-      PhaseMLTA(F);
-    } else {
-      // Phase 2-to-n: Modular type analysis
-      // TODO: only iterate over indirect calls
-      PhaseTyPM(F);
-    }
-  }
-
-  // Analysis phase control
-  if (Ctx->Modules.size() == MIdx) {
-
-    if (AnalysisPhase == 2) {
-      //
-      // Clear no longer useful structures
-      //
-      GVFuncTypesMap.clear();
-      TypesFromModuleGVMap.clear();
-      TypesToModuleGVMap.clear();
     }
 
-    if (AnalysisPhase >= 2) {
+    //
+    // Process functions
+    //
+    for (Module::iterator f = M->begin(), fe = M->end(); f != fe; ++f) {
 
-      ResolvedDepModulesMap.clear();
-      bool Iter = true;
-      // Merge the propagation maps
-      moPropMapAll.insert(moPropMap.begin(), moPropMap.end());
-      // Add map one by one to avoid overwritting
-      for (auto m : moPropMapV) {
-        moPropMapAll[m.first].insert(m.second.begin(), m.second.end());
+      Function *F = &*f;
+
+      if (F->isDeclaration() || F->isIntrinsic())
+        continue;
+
+      // Phase 1: Multi-layer type analysis
+      if (AnalysisPhase == 1) {
+        PhaseMLTA(F);
+      } else {
+        // Phase 2-to-n: Modular type analysis
+        // TODO: only iterate over indirect calls
+        PhaseTyPM(F);
+      }
+    }
+
+    // Analysis phase control
+    if (Ctx->Modules.size() == MIdx) {
+
+      if (AnalysisPhase == 2) {
+        //
+        // Clear no longer useful structures
+        //
+        GVFuncTypesMap.clear();
+        TypesFromModuleGVMap.clear();
+        TypesToModuleGVMap.clear();
       }
 
-      // TODO: multi-threading for better performance
+      if (AnalysisPhase >= 2) {
 
-      //
-      // Steps 2 and 3 of TyPM: Collecting depedent modules
-      // and resolving targets within  on dependent modules
-      //
+        ResolvedDepModulesMap.clear();
+        bool Iter = true;
+        // Merge the propagation maps
+        moPropMapAll.insert(moPropMap.begin(), moPropMap.end());
+        // Add map one by one to avoid overwritting
+        for (auto m : moPropMapV) {
+          moPropMapAll[m.first].insert(m.second.begin(), m.second.end());
+        }
+
+        // TODO: multi-threading for better performance
+
+        //
+        // Steps 2 and 3 of TyPM: Collecting depedent modules
+        // and resolving targets within  on dependent modules
+        //
 #ifdef FUNCTION_AS_TARGET_TYPE
-      bool NextIter = resolveFunctionTargets();
+        bool NextIter = resolveFunctionTargets();
 #else // struct as target type
-      bool NextIter = resolveStructTargets();
+        bool NextIter = resolveStructTargets();
 #endif
 
-      if (!NextIter) {
-        // Done with the iteration
-        MIdx = 0;
-        return false;
+        if (!NextIter) {
+          // Done with the iteration
+          MIdx = 0;
+          return false;
+        }
+
+        // Reset the map when phase >= 2
+        moPropMapV.clear();
+        moPropMapAll.clear();
+        ParsedModuleTypeICallMap.clear();
+        ParsedModuleTypeDCallMap.clear();
       }
 
-      // Reset the map when phase >= 2
-      moPropMapV.clear();
-      moPropMapAll.clear();
-      ParsedModuleTypeICallMap.clear();
-      ParsedModuleTypeDCallMap.clear();
+      ++AnalysisPhase;
+      MIdx = 0;
+      if (AnalysisPhase <= MAX_PHASE_CG) {
+        OP << "\n\n=== Move to phase " << AnalysisPhase << " ===\n\n";
+        return true;
+      }
     }
 
-    ++AnalysisPhase;
-    MIdx = 0;
-    if (AnalysisPhase <= MAX_PHASE_CG) {
-      OP << "\n\n=== Move to phase " << AnalysisPhase << " ===\n\n";
-      return true;
+    return false;
+  }
+
+  void CallGraphPass::processResults() {
+
+    // Load traces for evaluation
+    // Key: hash of SrcLn for caller
+    map<size_t, set<size_t>> hashedTraces;
+    map<size_t, SrcLn> hashSrcMap;
+    LoadTraces(hashedTraces, hashSrcMap);
+    size_t TraceCount = 0;
+    for (auto T : hashedTraces) {
+      TraceCount += T.second.size();
     }
-  }
+    OP << "@@ Trace size: " << TraceCount << "\n";
 
-  return false;
-}
-
-void CallGraphPass::processResults() {
-
-  // Load traces for evaluation
-  // Key: hash of SrcLn for caller
-  map<size_t, set<size_t>> hashedTraces;
-  map<size_t, SrcLn> hashSrcMap;
-  LoadTraces(hashedTraces, hashSrcMap);
-  size_t TraceCount = 0;
-  for (auto T : hashedTraces) {
-    TraceCount += T.second.size();
-  }
-  OP << "@@ Trace size: " << TraceCount << "\n";
-
-  for (auto T : hashedTraces) {
-    if (calleesSrcMap.find(T.first) == calleesSrcMap.end())
-      continue;
-    for (auto calleehash : T.second) {
-      if (srcLnHashSet.find(calleehash) == srcLnHashSet.end())
+    for (auto T : hashedTraces) {
+      if (calleesSrcMap.find(T.first) == calleesSrcMap.end())
         continue;
-      if (addrTakenFuncHashSet.find(calleehash) == addrTakenFuncHashSet.end())
-        continue;
-      if (calleesSrcMap[T.first].count(calleehash)) {
-        // the callee is in the target set
-        SrcLn Caller = hashSrcMap[T.first];
-        OP << "@ Found callee for: " << Caller.Src << " +" << Caller.Ln << "\n";
-      } else if (L1CalleesSrcMap[T.first].count(calleehash)) {
-        // false negative
-        OP << "!! Cannot find callee\n";
-        SrcLn Caller = hashSrcMap[T.first];
-        SrcLn Callee = hashSrcMap[calleehash];
-        OP << "@ Caller: " << Caller.Src << " +" << Caller.Ln << "\n";
-        OP << "\t@ Callee: " << Callee.Src << " +" << Callee.Ln << "\n";
+      for (auto calleehash : T.second) {
+        if (srcLnHashSet.find(calleehash) == srcLnHashSet.end())
+          continue;
+        if (addrTakenFuncHashSet.find(calleehash) == addrTakenFuncHashSet.end())
+          continue;
+        if (calleesSrcMap[T.first].count(calleehash)) {
+          // the callee is in the target set
+          SrcLn Caller = hashSrcMap[T.first];
+          OP << "@ Found callee for: " << Caller.Src << " +" << Caller.Ln
+             << "\n";
+        } else if (L1CalleesSrcMap[T.first].count(calleehash)) {
+          // false negative
+          OP << "!! Cannot find callee\n";
+          SrcLn Caller = hashSrcMap[T.first];
+          SrcLn Callee = hashSrcMap[calleehash];
+          OP << "@ Caller: " << Caller.Src << " +" << Caller.Ln << "\n";
+          OP << "\t@ Callee: " << Callee.Src << " +" << Callee.Ln << "\n";
+        }
       }
     }
   }
-}

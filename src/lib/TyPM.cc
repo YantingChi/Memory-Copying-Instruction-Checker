@@ -216,6 +216,48 @@ void TyPM::processCasts(set<User *> &CastSet, Module *M) {
 			continue;
 		if (TyFrom != Int8PtrTy[M] && TyTo != Int8PtrTy[M])
 			continue;
+		// // If TyFrom and TyTo are all struct types (or pointer to struct types)
+		// // Check if there are function pointer types inside
+		// // if yes, check if the fptr in TyFrom and TyTo are the same
+		// // If yes, print and record the cast
+		// Type *ETyFrom = TyFrom->getPointerElementType();
+		// Type *ETyTo = TyTo->getPointerElementType();
+		
+		// if (ETyFrom->isStructTy() && ETyTo->isStructTy()) {
+		// 	StructType *STyFrom = cast<StructType>(ETyFrom);
+		// 	StructType *STyTo = cast<StructType>(ETyTo);
+			
+		// 	// Collect function pointer types from both struct types
+		// 	set<Type*> FPtrsFrom, FPtrsTo;
+			
+		// 	for (unsigned i = 0; i < STyFrom->getNumElements(); ++i) {
+		// 		Type *ElemTy = STyFrom->getElementType(i);
+		// 		if (ElemTy->isPointerTy() && ElemTy->getPointerElementType()->isFunctionTy()) {
+		// 			FPtrsFrom.insert(ElemTy->getPointerElementType());
+		// 		}
+		// 	}
+			
+		// 	for (unsigned i = 0; i < STyTo->getNumElements(); ++i) {
+		// 		Type *ElemTy = STyTo->getElementType(i);
+		// 		if (ElemTy->isPointerTy() && ElemTy->getPointerElementType()->isFunctionTy()) {
+		// 			FPtrsTo.insert(ElemTy->getPointerElementType());
+		// 		}
+		// 	}
+			
+		// 	// Check if there are common function pointer types
+		// 	for (Type *FPtrFrom : FPtrsFrom) {
+		// 		if (FPtrsTo.find(FPtrFrom) != FPtrsTo.end()) {
+		// 			// Found matching function pointer type, record the cast
+		// 			CastFromMap[M][TyTo].insert(TyFrom);
+		// 			CastToMap[M][TyFrom].insert(TyTo);
+		// 			OP << "@@ Struct cast with matching function pointer: "
+		// 			   << *TyFrom << " ==> " << *TyTo << "\n";
+		// 			break;
+		// 		}
+		// 	}
+		// }
+
+
 
 		Type *ETyFrom = TyFrom->getPointerElementType();
 		Type *ETyTo = TyTo->getPointerElementType();
@@ -225,11 +267,11 @@ void TyPM::processCasts(set<User *> &CastSet, Module *M) {
 		}
 
 
-		Type *BTyFrom = TyFrom, *BTyTo = TyTo;
-		if (BTyFrom && BTyTo) {
-			CastFromMap[M][TyTo].insert(TyFrom);
-			CastToMap[M][TyFrom].insert(TyTo);
-		}
+		// Type *BTyFrom = TyFrom, *BTyTo = TyTo;
+		// if (BTyFrom && BTyTo) {
+		// 	CastFromMap[M][TyTo].insert(TyFrom);
+		// 	CastToMap[M][TyFrom].insert(TyTo);
+		// }
 	}
 }
 
