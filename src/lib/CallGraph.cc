@@ -145,8 +145,41 @@ void checkMemoryRelatedInsts(Function *F, Module *M) {
               // Check if it's a GEP instruction
               else if (GetElementPtrInst *gepInst = dyn_cast<GetElementPtrInst>(defInst)) {
                 Type *sourceType = gepInst->getSourceElementType();
-                OP << "[" << paramName << "] GEP into: " << *sourceType << "\n";
-                return sourceType;
+                Type *resultType = gepInst->getResultElementType();
+                
+                // Get the actual pointed-to type (what the GEP result points to)
+                Type *pointedToType = resultType;
+                
+                // Log the GEP operation with indices for better debugging
+                OP << "[" << paramName << "] GEP from struct: " << *sourceType;
+                OP << " indices:";
+                for (unsigned i = 1; i < gepInst->getNumOperands(); ++i) {
+                  if (ConstantInt *CI = dyn_cast<ConstantInt>(gepInst->getOperand(i))) {
+                    OP << " " << CI->getZExtValue();
+                  } else {
+                    OP << " ?";
+                  }
+                }
+                OP << " -> field type: " << *pointedToType << "\n";
+                
+                return pointedToType;
+              }
+              // Check if it's a load instruction
+              else if (LoadInst *loadInst = dyn_cast<LoadInst>(defInst)) {
+                Value *ptr = loadInst->getPointerOperand();
+                OP << "[" << paramName << "] Load from: " << *ptr << "\n";
+                currentVal = ptr;
+                continue;
+              }
+              // Check if it's a PHI node
+              else if (PHINode *phi = dyn_cast<PHINode>(defInst)) {
+                OP << "[" << paramName << "] PHI node with " << phi->getNumIncomingValues() << " values\n";
+                if (phi->getNumIncomingValues() > 0) {
+                  // For simplicity, trace the first incoming value
+                  // In a more sophisticated analysis, you'd want to handle all branches
+                  currentVal = phi->getIncomingValue(0);
+                  continue;
+                }
               }
               // If we can't trace further, break
               break;
@@ -168,13 +201,66 @@ void checkMemoryRelatedInsts(Function *F, Module *M) {
         Type* destType=traceParameterType(dest, "Dest");
         Type* srcType=traceParameterType(src, "Src");
 
+        // Normalize types to ensure consistent comparison
+        auto normalizeType = [](Type* type) -> Type* {
+          if (!type) return nullptr;
+          
+          // If it's a pointer to struct, try to get the struct type
+          if (type->isPointerTy()) {
+            // For opaque pointers, we can't easily get the pointed-to type
+            // so we'll handle this in a different way - check if it's a struct pointer
+            // by examining the context or using the information we already have
+            return type; // Keep as pointer type for now
+          }
+          
+          // If it's already a struct type, return as is
+          if (type->isStructTy()) {
+            return type;
+          }
+          
+          return type;
+        };
+        
+        Type* normalizedDestType = normalizeType(destType);
+        Type* normalizedSrcType = normalizeType(srcType);
+
+        // Enhanced type comparison that handles both struct types and struct pointers
+        auto typesMatch = [](Type* type1, Type* type2) -> bool {
+          if (!type1 || !type2) return false;
+          
+          // Direct match
+          if (type1 == type2) return true;
+          
+          // Handle struct vs struct* cases
+          if (type1->isStructTy() && type2->isPointerTy()) {
+            // Can't safely get pointee type in newer LLVM, so we use string comparison
+            std::string type1Str, type2Str;
+            llvm::raw_string_ostream stream1(type1Str), stream2(type2Str);
+            type1->print(stream1);
+            type2->print(stream2);
+            
+            // Check if type2 is a pointer to type1
+            return type2Str.find(type1Str + "*") != std::string::npos;
+          }
+          
+          if (type2->isStructTy() && type1->isPointerTy()) {
+            // Check if type1 is a pointer to type2
+            std::string type1Str, type2Str;
+            llvm::raw_string_ostream stream1(type1Str), stream2(type2Str);
+            type1->print(stream1);
+            type2->print(stream2);
+            
+            return type1Str.find(type2Str + "*") != std::string::npos;
+          }
+          
+          return false;
+        };
+
         totalMemCopyCalls++;
 
-        // Check what types we actually found
-        bool destIsStruct = destType && (destType->isStructTy() || 
-                           (destType->isPointerTy() && destType->getPointerElementType()->isStructTy()));
-        bool srcIsStruct = srcType && (srcType->isStructTy() || 
-                          (srcType->isPointerTy() && srcType->getPointerElementType()->isStructTy()));
+        // Check what types we actually found (use normalized types)
+        bool destIsStruct = normalizedDestType && normalizedDestType->isStructTy();
+        bool srcIsStruct = normalizedSrcType && normalizedSrcType->isStructTy();
 
         if (destIsStruct && srcIsStruct) {
           bothStructCases++;
@@ -196,16 +282,34 @@ void checkMemoryRelatedInsts(Function *F, Module *M) {
         }
 
 
-        if(destType && srcType && destType->isStructTy() && srcType->isStructTy()) {
+        if(normalizedDestType && normalizedSrcType && normalizedDestType->isStructTy() && normalizedSrcType->isStructTy()) {
            OP << "[Struct Types] Both dest and src are struct types:\n";
+           OP << "  Dest: " << *normalizedDestType << "\n";
+           OP << "  Src:  " << *normalizedSrcType << "\n";
+           
+           // Special case: Check for struct-to-struct type mismatch (potential type confusion)
+           if (!typesMatch(normalizedDestType, normalizedSrcType)) {
+             OP << "🚨 [CRITICAL] STRUCT-TO-STRUCT TYPE CONFUSION DETECTED! 🚨\n";
+             OP << "  This is a potential security vulnerability!\n";
+             OP << "  Copying from: " << *normalizedSrcType << "\n";
+             OP << "  Copying to:   " << *normalizedDestType << "\n";
+             OP << "  Location: ";
+             if (DILocation *Loc = I->getDebugLoc()) {
+               OP << Loc->getFilename() << ":" << Loc->getLine() << ":" << Loc->getColumn() << "\n";
+             } else {
+               OP << "Unknown location\n";
+             }
+           }
         }
-        // Check if dest and src types are different and both are aggregate types
-        if (destType && srcType && destType != srcType) {
-          OP << "[Type Mismatch] Non-aggregate Different types detected\n";
-          if (destType->isAggregateType() && srcType->isAggregateType()) {
+        // Check if dest and src types match using enhanced comparison
+        if (typesMatch(normalizedDestType, normalizedSrcType)) {
+          OP << "[Type Match] Same types detected: " << *normalizedDestType << " and " << *normalizedSrcType << "\n";
+        } else if (normalizedDestType && normalizedSrcType) {
+          OP << "[Type Mismatch] Different types detected\n";
+          if (normalizedDestType->isAggregateType() && normalizedSrcType->isAggregateType()) {
             OP << "[Type Mismatch] Different aggregate types detected:\n";
-            OP << "  Dest type: " << *destType << "\n";
-            OP << "  Src type: " << *srcType << "\n";
+            OP << "  Dest type: " << *normalizedDestType << "\n";
+            OP << "  Src type: " << *normalizedSrcType << "\n";
           }
         }
 
