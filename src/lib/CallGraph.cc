@@ -48,6 +48,11 @@ int CallGraphPass::AnalysisPhase = 1;
 //
 
 void checkMemoryRelatedInsts(Function *F, Module *M) {
+  static int totalMemCopyCalls = 0;
+  static int bothStructCases = 0;
+  static int oneStructCases = 0;
+  static int noStructCases = 0;
+  
   for (inst_iterator i = inst_begin(F), e = inst_end(F); i != e; ++i) {
     Instruction *I = &*i;
     bool ifMemCopy = false;
@@ -115,42 +120,80 @@ void checkMemoryRelatedInsts(Function *F, Module *M) {
         Value *dest = memCopyCall->getOperand(0);
         Value *src = memCopyCall->getOperand(1);
          OP << "What is dest and src?" << *dest << " , " << *src << "\n";
-        // Trace back one layer to find definitions and check types
+        // Trace back recursively to find original struct types
         auto traceParameterType = [](Value *param, const std::string &paramName) -> Type* {
-          if (Instruction *defInst = dyn_cast<Instruction>(param)) {
-            OP << "[" << paramName << "] Defined by: " << *defInst << "\n";
-            OP << "[" << paramName << "] Type: " << *param->getType() << "\n";
-            
-            // Check if it's a cast instruction
-            if (CastInst *castInst = dyn_cast<CastInst>(defInst)) {
-              Value *srcValue = castInst->getOperand(0);
-              OP << "[" << paramName << "] Cast source type: " << *srcValue->getType() << "\n";
-              return srcValue->getType();
+          Value* currentVal = param;
+          Type* originalType = nullptr;
+          
+          // Trace back through casts to find the original type
+          for (int depth = 0; depth < 5; ++depth) {
+            if (Instruction *defInst = dyn_cast<Instruction>(currentVal)) {
+              OP << "[" << paramName << "] Trace step: " << *defInst << "\n";
+              
+              // Check if it's a cast instruction - trace further back
+              if (CastInst *castInst = dyn_cast<CastInst>(defInst)) {
+                Value *srcValue = castInst->getOperand(0);
+                OP << "[" << paramName << "] Cast from: " << *srcValue->getType() << " to " << *currentVal->getType() << "\n";
+                
+                // If source is a struct pointer, that's our original type
+                if (srcValue->getType()->isPointerTy()) {
+                  originalType = srcValue->getType();
+                }
+                currentVal = srcValue;
+                continue;
+              }
+              // Check if it's a GEP instruction
+              else if (GetElementPtrInst *gepInst = dyn_cast<GetElementPtrInst>(defInst)) {
+                Type *sourceType = gepInst->getSourceElementType();
+                OP << "[" << paramName << "] GEP into: " << *sourceType << "\n";
+                return sourceType;
+              }
+              // If we can't trace further, break
+              break;
+            } else {
+              break;
             }
-            // Check if it's a load instruction
-            else if (LoadInst *loadInst = dyn_cast<LoadInst>(defInst)) {
-              Value *ptr = loadInst->getPointerOperand();
-              OP << "[" << paramName << "] Loaded from type: " << *ptr->getType() << "\n";
-              return ptr->getType();
-            }
-            // Check if it's a GEP instruction
-            else if (GetElementPtrInst *gepInst = dyn_cast<GetElementPtrInst>(defInst)) {
-              OP << "[" << paramName << "] GEP source type: " << *gepInst->getSourceElementType() << "\n";
-              return gepInst->getSourceElementType();
-            }
-          } else if (Argument *arg = dyn_cast<Argument>(param)) {
-            OP << "[" << paramName << "] Function argument type: " << *param->getType() << "\n";
-            return param->getType();
-          } else {
-            OP << "[" << paramName << "] Other value type: " << *param->getType() << "\n";
-            return param->getType();
           }
-          return nullptr;
+          
+          if (originalType) {
+            OP << "[" << paramName << "] Found original type: " << *originalType << "\n";
+            return originalType;
+          }
+          
+          OP << "[" << paramName << "] Final type: " << *currentVal->getType() << "\n";
+          return currentVal->getType();
         };
         
 
         Type* destType=traceParameterType(dest, "Dest");
         Type* srcType=traceParameterType(src, "Src");
+
+        totalMemCopyCalls++;
+
+        // Check what types we actually found
+        bool destIsStruct = destType && (destType->isStructTy() || 
+                           (destType->isPointerTy() && destType->getPointerElementType()->isStructTy()));
+        bool srcIsStruct = srcType && (srcType->isStructTy() || 
+                          (srcType->isPointerTy() && srcType->getPointerElementType()->isStructTy()));
+
+        if (destIsStruct && srcIsStruct) {
+          bothStructCases++;
+          OP << "[BOTH STRUCTS] Case " << bothStructCases << "/" << totalMemCopyCalls << "\n";
+        } else if (destIsStruct || srcIsStruct) {
+          oneStructCases++;
+          OP << "[ONE STRUCT] Case " << oneStructCases << "/" << totalMemCopyCalls << "\n";
+        } else {
+          noStructCases++;
+          OP << "[NO STRUCTS] Case " << noStructCases << "/" << totalMemCopyCalls << "\n";
+        }
+
+        // Print summary every 100 calls
+        if (totalMemCopyCalls % 100 == 0) {
+          OP << "=== STATISTICS after " << totalMemCopyCalls << " memcpy calls ===\n";
+          OP << "Both structs: " << bothStructCases << " (" << (bothStructCases*100.0/totalMemCopyCalls) << "%)\n";
+          OP << "One struct: " << oneStructCases << " (" << (oneStructCases*100.0/totalMemCopyCalls) << "%)\n";
+          OP << "No structs: " << noStructCases << " (" << (noStructCases*100.0/totalMemCopyCalls) << "%)\n";
+        }
 
 
         if(destType && srcType && destType->isStructTy() && srcType->isStructTy()) {
