@@ -1,5 +1,5 @@
 CUR_DIR = $(shell pwd)
-LLVM_BUILD := ${CUR_DIR}/llvm-project/prefix
+LLVM_BUILD := /home/yantingchi/Desktop/llvm/clang-14/
 ANALYZER_DIR := ${CUR_DIR}/src
 ANALYZER_BUILD := ${CUR_DIR}/build
 
@@ -18,7 +18,7 @@ build_analyzer_func = \
 			LLVM_TOOLS_BINARY_DIR=${LLVM_BUILD}/bin \
 			LLVM_LIBRARY_DIRS=${LLVM_BUILD}/lib \
 			LLVM_INCLUDE_DIRS=${LLVM_BUILD}/include \
-			CC=clang CXX=clang++ \
+			CC=gcc CXX=g++ \
 			cmake ${1}	\
 				-DCMAKE_BUILD_TYPE=Build \
 				-DLLVM_ENABLE_ASSERTIONS=ON \
