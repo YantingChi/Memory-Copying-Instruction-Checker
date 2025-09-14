@@ -27,6 +27,9 @@ class CallGraphPass :
 		// Phases
 		void PhaseMLTA(Function *F);
 		void PhaseTyPM(Function *F);
+		
+		// Memory analysis methods
+		void checkMemoryRelatedInsts_MLTA(Function *F, Module *M);
 
 
 	public:
