@@ -14,6 +14,7 @@
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DebugInfo.h"
+#include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstIterator.h"
@@ -48,6 +49,55 @@ int CallGraphPass::AnalysisPhase = 1;
 //
 list<typeidx_t> TyChain;
 bool Complete = true;
+
+bool aggresiveCheckIfFptr(Type *srcType, Type *destType){
+  StructType* sty_src=dyn_cast<StructType>(srcType);
+  StructType* sty_dest=dyn_cast<StructType>(destType);
+  if (!sty_src || !sty_dest) {
+    return false;
+  }
+  StructType *sty=(sty_src->getNumElements() > sty_dest->getNumElements())?sty_dest:sty_src;
+  // Check if the smaller struct has function pointer fields recursively
+  std::function<bool(Type*)> hasRecursiveFunctionPointer = [&](Type* ty) -> bool {
+    if (!ty) return false;
+    
+    // If it's a pointer type, get the pointed-to type
+    if (ty->isPointerTy()) {
+      // For opaque pointers in newer LLVM, we can't easily get the pointee type
+      // so we'll use string representation to check if it's a function pointer
+      std::string typeStr;
+      llvm::raw_string_ostream stream(typeStr);
+      ty->print(stream);
+      stream.flush();
+      
+      // Check if it's a function pointer by looking for function signature pattern
+      if (typeStr.find("(") != std::string::npos && typeStr.find(")*") != std::string::npos) {
+        return true;
+      }
+      return false;
+    }
+    
+    // If it's a function type
+    if (ty->isFunctionTy()) {
+      return true;
+    }
+    
+    // If it's a struct type, check all its fields recursively
+    if (StructType* structTy = dyn_cast<StructType>(ty)) {
+      for (unsigned i = 0; i < structTy->getNumElements(); ++i) {
+        Type* fieldType = structTy->getElementType(i);
+        if (hasRecursiveFunctionPointer(fieldType)) {
+          return true;
+        }
+      }
+    }
+    
+    return false;
+  };
+
+  return hasRecursiveFunctionPointer(sty);
+}
+
 
 void CallGraphPass::checkMemoryRelatedInsts_MLTA(Function *F, Module *M) {
 
@@ -107,9 +157,6 @@ void CallGraphPass::checkMemoryRelatedInsts_MLTA(Function *F, Module *M) {
       if (DILocation *Loc = I->getDebugLoc()) {
         OP << "Source location: " << Loc->getFilename() << ":" << Loc->getLine()
            << ":" << Loc->getColumn() << "\n";
-        if (DISubprogram *SP = Loc->getScope()->getSubprogram()) {
-          OP << "Function: " << SP->getName() << "\n";
-        }
       } else {
         OP << "No debug location available\n";
       }
@@ -118,7 +165,8 @@ void CallGraphPass::checkMemoryRelatedInsts_MLTA(Function *F, Module *M) {
         // Get first two parameters (dest and src)
         Value *dest = memCopyCall->getOperand(0);
         Value *src = memCopyCall->getOperand(1);
-        OP << "What is dest and src?" << *dest << " , " << *src << "\n";
+        OP << "[dest] \t:" << *dest << "\n";
+        OP << "[src ] \t:" << *src << "\n";
 
         // for dest
         list<typeidx_t> TyChain_dest;
@@ -128,234 +176,392 @@ void CallGraphPass::checkMemoryRelatedInsts_MLTA(Function *F, Module *M) {
         list<typeidx_t> TyChain_src;
         bool Complete_src = true;
         getBaseTypeChain(TyChain_src, src, Complete_src);
+        // OP << "[Dest Type Chain] ";
+        // for (auto TyIdx : TyChain_dest) {
+        //   OP << *(TyIdx.first) << " , Idx: " << TyIdx.second << " <- ";
+        // } // for dest
 
-        for (auto TyIdx : TyChain_dest) {
-          OP << "[MemCopy] Dest Type Chain: " << *(TyIdx.first)
-             << " , Idx: " << TyIdx.second << "\t";
-        } // for dest
-        OP << "\n";
-        for (auto TyIdx : TyChain_src) {
-          OP << "[MemCopy] Src Type Chain: " << *(TyIdx.first)
-             << " , Idx: " << TyIdx.second << "\t";
+        // OP << "\n";
+        Type *destType = dest->getType(); // Default to the original type
+        if (!TyChain_dest.empty() && TyChain_dest.front().first) {
+          if (StructType *sty =
+                  dyn_cast<StructType>(TyChain_dest.front().first)) {
+            unsigned int fieldIdx = TyChain_dest.front().second;
+            if (fieldIdx == 0) {
+              destType = sty;
+            } else if (fieldIdx < sty->getNumElements()) {
+              Type *desttype = sty->getElementType(fieldIdx);
+              OP << "Field type of dest: " << *desttype << "\n";
+              destType = desttype; // Update destType to the field type
+            } else {
+              OP << "Warning: Field index " << fieldIdx
+                 << " out of range for struct with " << sty->getNumElements()
+                 << " elements\n";
+            }
+          }
         }
-        // for src
 
-        // Trace back recursively to find original struct types
-        //   auto traceParameterType = [](Value *param, const std::string
-        //   &paramName) -> Type* {
-        //     Value* currentVal = param;
-        //     Type* originalType = nullptr;
+        // OP << "[Src Type Chain] ";
+        // for (auto TyIdx : TyChain_src) {
+        //   OP << *(TyIdx.first) << " , Idx: " << TyIdx.second << " <- ";
+        // }
+        // OP << "\n";
+        Type *srcType = src->getType(); // Default to the original type
+        if (!TyChain_src.empty() && TyChain_src.front().first) {
+          if (StructType *sty =
+                  dyn_cast<StructType>(TyChain_src.front().first)) {
+            unsigned int fieldIdx = TyChain_src.front().second;
+            if (fieldIdx == 0) {
+              srcType = sty;
+            } else if (fieldIdx < sty->getNumElements()) {
+              Type *srctype = sty->getElementType(fieldIdx);
+              OP << "Field type of src: " << *srctype << "\n";
+              srcType = srctype; // Update srcType to the field type
+            } else {
+              OP << "Warning: Field index " << fieldIdx
+                 << " out of range for struct with " << sty->getNumElements()
+                 << " elements\n";
+            }
+          }
+        }
 
-        //     // Trace back through casts to find the original type
-        //     for (int depth = 0; depth < 5; ++depth) {
-        //       if (Instruction *defInst = dyn_cast<Instruction>(currentVal)) {
-        //         OP << "[" << paramName << "] Trace step: " << *defInst <<
-        //         "\n";
+        // Normalize types to ensure consistent comparison
+        auto normalizeType = [](Type *type) -> Type * {
+          if (!type)
+            return nullptr;
 
-        //         // Check if it's a cast instruction - trace further back
-        //         if (CastInst *castInst = dyn_cast<CastInst>(defInst)) {
-        //           Value *srcValue = castInst->getOperand(0);
-        //           OP << "[" << paramName << "] Cast from: " <<
-        //           *srcValue->getType() << " to " << *currentVal->getType() <<
-        //           "\n";
+          // If it's a pointer to struct, try to get the struct type
+          if (type->isPointerTy()) {
+            // For opaque pointers, we can't easily get the pointed-to type
+            // so we'll handle this in a different way - check if it's a
+            // struct pointer
+            // by examining the context or using the information we already
+            // have
+            return type; // Keep as pointer type for now
+          }
 
-        //           // If source is a struct pointer, that's our original type
-        //           if (srcValue->getType()->isPointerTy()) {
-        //             originalType = srcValue->getType();
-        //           }
-        //           currentVal = srcValue;
-        //           continue;
-        //         }
-        //         // Check if it's a GEP instruction
-        //         else if (GetElementPtrInst *gepInst =
-        //         dyn_cast<GetElementPtrInst>(defInst)) {
-        //           Type *sourceType = gepInst->getSourceElementType();
-        //           Type *resultType = gepInst->getResultElementType();
+          // If it's already a struct type, return as is
+          if (type->isStructTy()) {
+            return type;
+          }
 
-        //           // Get the actual pointed-to type (what the GEP result
-        //           points to) Type *pointedToType = resultType;
+          return type;
+        };
 
-        //           // Log the GEP operation with indices for better debugging
-        //           OP << "[" << paramName << "] GEP from struct: " <<
-        //           *sourceType; OP << " indices:"; for (unsigned i = 1; i <
-        //           gepInst->getNumOperands(); ++i) {
-        //             if (ConstantInt *CI =
-        //             dyn_cast<ConstantInt>(gepInst->getOperand(i))) {
-        //               OP << " " << CI->getZExtValue();
-        //             } else {
-        //               OP << " ?";
-        //             }
-        //           }
-        //           OP << " -> field type: " << *pointedToType << "\n";
+        Type *normalizedDestType = normalizeType(destType);
+        Type *normalizedSrcType = normalizeType(srcType);
 
-        //           return pointedToType;
-        //         }
-        //         // Check if it's a load instruction
-        //         else if (LoadInst *loadInst = dyn_cast<LoadInst>(defInst)) {
-        //           Value *ptr = loadInst->getPointerOperand();
-        //           OP << "[" << paramName << "] Load from: " << *ptr << "\n";
-        //           currentVal = ptr;
-        //           continue;
-        //         }
-        //         // Check if it's a PHI node
-        //         else if (PHINode *phi = dyn_cast<PHINode>(defInst)) {
-        //           OP << "[" << paramName << "] PHI node with " <<
-        //           phi->getNumIncomingValues() << " values\n"; if
-        //           (phi->getNumIncomingValues() > 0) {
-        //             // For simplicity, trace the first incoming value
-        //             // In a more sophisticated analysis, you'd want to handle
-        //             all branches currentVal = phi->getIncomingValue(0);
-        //             continue;
-        //           }
-        //         }
-        //         // If we can't trace further, break
-        //         break;
-        //       } else {
-        //         break;
-        //       }
-        //     }
+        // Enhanced type comparison that handles both struct types and
+        // struct pointers
+        auto typesMatch = [](Type *type1, Type *type2) -> bool {
+          if (!type1 || !type2)
+            return false;
 
-        //     if (originalType) {
-        //       OP << "[" << paramName << "] Found original type: " <<
-        //       *originalType << "\n"; return originalType;
-        //     }
+          // Direct match
+          if (type1 == type2)
+            return true;
 
-        //     OP << "[" << paramName << "] Final type: " <<
-        //     *currentVal->getType() << "\n"; return currentVal->getType();
-        //   };
+          // Handle struct vs struct* cases
+          if (type1->isStructTy() && type2->isPointerTy()) {
+            // Can't safely get pointee type in newer LLVM, so we use
+            // string comparison
+            std::string type1Str, type2Str;
+            llvm::raw_string_ostream stream1(type1Str), stream2(type2Str);
+            type1->print(stream1);
+            type2->print(stream2);
 
-        //   Type* destType=traceParameterType(dest, "Dest");
-        //   Type* srcType=traceParameterType(src, "Src");
+            // Check if type2 is a pointer to type1
+            return type2Str.find(type1Str + "*") != std::string::npos;
+          }
 
-        //   // Normalize types to ensure consistent comparison
-        //   auto normalizeType = [](Type* type) -> Type* {
-        //     if (!type) return nullptr;
+          if (type2->isStructTy() && type1->isPointerTy()) {
+            // Check if type1 is a pointer to type2
+            std::string type1Str, type2Str;
+            llvm::raw_string_ostream stream1(type1Str), stream2(type2Str);
+            type1->print(stream1);
+            type2->print(stream2);
 
-        //     // If it's a pointer to struct, try to get the struct type
-        //     if (type->isPointerTy()) {
-        //       // For opaque pointers, we can't easily get the pointed-to type
-        //       // so we'll handle this in a different way - check if it's a
-        //       struct pointer
-        //       // by examining the context or using the information we already
-        //       have return type; // Keep as pointer type for now
-        //     }
+            return type1Str.find(type2Str + "*") != std::string::npos;
+          }
 
-        //     // If it's already a struct type, return as is
-        //     if (type->isStructTy()) {
-        //       return type;
-        //     }
-
-        //     return type;
-        //   };
-
-        //   Type* normalizedDestType = normalizeType(destType);
-        //   Type* normalizedSrcType = normalizeType(srcType);
-
-        //   // Enhanced type comparison that handles both struct types and
-        //   struct pointers auto typesMatch = [](Type* type1, Type* type2) ->
-        //   bool {
-        //     if (!type1 || !type2) return false;
-
-        //     // Direct match
-        //     if (type1 == type2) return true;
-
-        //     // Handle struct vs struct* cases
-        //     if (type1->isStructTy() && type2->isPointerTy()) {
-        //       // Can't safely get pointee type in newer LLVM, so we use
-        //       string comparison std::string type1Str, type2Str;
-        //       llvm::raw_string_ostream stream1(type1Str), stream2(type2Str);
-        //       type1->print(stream1);
-        //       type2->print(stream2);
-
-        //       // Check if type2 is a pointer to type1
-        //       return type2Str.find(type1Str + "*") != std::string::npos;
-        //     }
-
-        //     if (type2->isStructTy() && type1->isPointerTy()) {
-        //       // Check if type1 is a pointer to type2
-        //       std::string type1Str, type2Str;
-        //       llvm::raw_string_ostream stream1(type1Str), stream2(type2Str);
-        //       type1->print(stream1);
-        //       type2->print(stream2);
-
-        //       return type1Str.find(type2Str + "*") != std::string::npos;
-        //     }
-
-        //     return false;
-        //   };
+          return false;
+        };
 
         //   totalMemCopyCalls++;
 
-        //   // Check what types we actually found (use normalized types)
-        //   bool destIsStruct = normalizedDestType &&
-        //   normalizedDestType->isStructTy(); bool srcIsStruct =
-        //   normalizedSrcType && normalizedSrcType->isStructTy();
+        // Check what types we actually found (use normalized types)
+        bool destIsStruct =
+            normalizedDestType && normalizedDestType->isStructTy();
+        bool srcIsStruct = normalizedSrcType && normalizedSrcType->isStructTy();
 
-        //   if (destIsStruct && srcIsStruct) {
-        //     bothStructCases++;
-        //     OP << "[BOTH STRUCTS] Case " << bothStructCases << "/" <<
-        //     totalMemCopyCalls << "\n";
-        //   } else if (destIsStruct || srcIsStruct) {
-        //     oneStructCases++;
-        //     OP << "[ONE STRUCT] Case " << oneStructCases << "/" <<
-        //     totalMemCopyCalls << "\n";
-        //   } else {
-        //     noStructCases++;
-        //     OP << "[NO STRUCTS] Case " << noStructCases << "/" <<
-        //     totalMemCopyCalls << "\n";
-        //   }
+        if (destIsStruct && srcIsStruct) {
+          // bothStructCases++;
+          OP << "[BOTH STRUCTS] "; // << bothStructCases << "/" <<
+          // totalMemCopyCalls << "\n";
+        } else if (destIsStruct || srcIsStruct) {
+          // oneStructCases++;
+          OP << "[ONE STRUCT] Case "; // << oneStructCases << "/" <<
+          // totalMemCopyCalls << "\n";
+        } else {
+          // noStructCases++;
+          OP << "[NO STRUCTS] Case "; // << noStructCases << "/" <<
+          // totalMemCopyCalls << "\n";
+        }
 
-        //   // Print summary every 100 calls
-        //   if (totalMemCopyCalls % 100 == 0) {
-        //     OP << "=== STATISTICS after " << totalMemCopyCalls << " memcpy
-        //     calls ===\n"; OP << "Both structs: " << bothStructCases << " ("
-        //     << (bothStructCases*100.0/totalMemCopyCalls) << "%)\n"; OP <<
-        //     "One struct: " << oneStructCases << " (" <<
-        //     (oneStructCases*100.0/totalMemCopyCalls) << "%)\n"; OP << "No
-        //     structs: " << noStructCases << " (" <<
-        //     (noStructCases*100.0/totalMemCopyCalls) << "%)\n";
-        //   }
+        if (normalizedDestType && normalizedSrcType &&
+            normalizedDestType->isStructTy() &&
+            normalizedSrcType->isStructTy()) {
+          OP << " Both dest and src are struct types:\n";
+          OP << "[Dest] " << *normalizedDestType << "\n";
+          OP << "[Src ]  " << *normalizedSrcType << "\n";
 
-        //   if(normalizedDestType && normalizedSrcType &&
-        //   normalizedDestType->isStructTy() &&
-        //   normalizedSrcType->isStructTy()) {
-        //      OP << "[Struct Types] Both dest and src are struct types:\n";
-        //      OP << "  Dest: " << *normalizedDestType << "\n";
-        //      OP << "  Src:  " << *normalizedSrcType << "\n";
 
-        //      // Special case: Check for struct-to-struct type mismatch
-        //      (potential type confusion) if (!typesMatch(normalizedDestType,
-        //      normalizedSrcType)) {
-        //        OP << "🚨 [CRITICAL] STRUCT-TO-STRUCT TYPE CONFUSION DETECTED!
-        //        🚨\n"; OP << "  This is a potential security
-        //        vulnerability!\n"; OP << "  Copying from: " <<
-        //        *normalizedSrcType << "\n"; OP << "  Copying to:   " <<
-        //        *normalizedDestType << "\n"; OP << "  Location: "; if
-        //        (DILocation *Loc = I->getDebugLoc()) {
-        //          OP << Loc->getFilename() << ":" << Loc->getLine() << ":" <<
-        //          Loc->getColumn() << "\n";
-        //        } else {
-        //          OP << "Unknown location\n";
-        //        }
-        //      }
-        //   }
-        //   // Check if dest and src types match using enhanced comparison
-        //   if (typesMatch(normalizedDestType, normalizedSrcType)) {
-        //     OP << "[Type Match] Same types detected: " << *normalizedDestType
-        //     << " and " << *normalizedSrcType << "\n";
-        //   } else if (normalizedDestType && normalizedSrcType) {
-        //     OP << "[Type Mismatch] Different types detected\n";
-        //     if (normalizedDestType->isAggregateType() &&
-        //     normalizedSrcType->isAggregateType()) {
-        //       OP << "[Type Mismatch] Different aggregate types detected:\n";
-        //       OP << "  Dest type: " << *normalizedDestType << "\n";
-        //       OP << "  Src type: " << *normalizedSrcType << "\n";
-        //     }
-        //   }
+
+          // Special case: Check for struct-to-struct type mismatch
+          //  (potential type confusion)
+          if (!typesMatch(normalizedDestType, normalizedSrcType)) {
+
+            // exceptional condition
+            // i) one is the son of the other
+            int fieldIdx1 = TyChain_src.front().second;
+            int fieldIdx2 = TyChain_dest.front().second;
+            StructType* sty_src=dyn_cast<StructType>(normalizedSrcType);
+            StructType* sty_dest=dyn_cast<StructType>(normalizedDestType);
+            if (fieldIdx1 == 0) {
+              // dest might be son of src
+              if (normalizedDestType == sty_src->getElementType(0)) {
+                OP << "⚠️  Exceptional condition: dest is son of src\n";
+                continue;
+              }
+            }
+            if (fieldIdx2 == 0) {
+              // src might be son of dest
+              if (normalizedSrcType == sty_dest->getElementType(0)) {
+                OP << "⚠️  Exceptional condition: src is son of dest\n";
+                continue;
+              }
+              // condition 2 one of the structs do not have fptr field.
+              if(!aggresiveCheckIfFptr(normalizedSrcType,normalizedDestType)){
+                OP << "⚠️  Exceptional condition: one struct does not have fptr "
+                      "field\n";
+                continue;
+              }
+              // condition 3 if struct type1 and struct type2 have the exactly
+              // same definition, every field is identical
+                StructType *st1 = dyn_cast<StructType>(normalizedSrcType);
+                StructType *st2 = dyn_cast<StructType>(normalizedDestType);
+                if (st1->getNumElements() == st2->getNumElements()) {
+                  bool allFieldsMatch = true;
+                  for (unsigned int idx = 0; idx < st1->getNumElements();
+                       idx++) {
+                    if (st1->getElementType(idx) != st2->getElementType(idx)) {
+                      allFieldsMatch = false;
+                      break;
+                    }
+                  }
+                  if (allFieldsMatch) {
+                    OP << "⚠️  Exceptional condition: both struct types have "
+                          "identical definitions\n";
+                    continue;
+                  }
+                }
+
+
+              // if non of the condition applies
+              OP << "🚨 [CRITICAL] STRUCT-TO-STRUCT TYPE CONFUSION "
+                    "DETECTED!🚨\n";
+
+              // OP << "  Copying from: " << *normalizedSrcType << "\n";
+              // OP << "  Copying to:   " << *normalizedDestType << "\n";
+              // OP << "  Location: ";
+              // if (DILocation *Loc = I->getDebugLoc()) {
+              //   OP << Loc->getFilename() << ":" << Loc->getLine() << ":"
+              //      << Loc->getColumn() << "\n";
+              // } else {
+              //   OP << "Unknown location\n";
+              // }
+            }
+          }
+          // Check if dest and src types match using enhanced comparison
+          if (typesMatch(normalizedDestType, normalizedSrcType)) {
+            OP << "[Type Match] Same types detected\n";//: " << *normalizedDestType
+              //  << " and " << *normalizedSrcType << "\n";
+          } else if (normalizedDestType && normalizedSrcType) {
+            OP << "[Type Mismatch] Different types detected\n";
+            // if (normalizedDestType->isAggregateType() &&
+            //     normalizedSrcType->isAggregateType()) {
+            //   OP << "[Type Mismatch] Different aggregate types detected:\n";
+            //   OP << "  Dest type: " << *normalizedDestType << "\n";
+            //   OP << "  Src type: " << *normalizedSrcType << "\n";
+            // }
+          }
+        }
       }
     }
   }
 }
+
+
+bool CallGraphPass::doInitialization(Module *M) {
+
+  OP << "#" << MIdx << " Initializing: " << M->getName() << "\n";
+
+  ++MIdx;
+
+  DLMap[M] = &(M->getDataLayout());
+  Int8PtrTy[M] = Type::getInt8PtrTy(M->getContext());
+  assert(Int8PtrTy[M]);
+  IntPtrTy[M] = DLMap[M]->getIntPtrType(M->getContext());
+
+  set<User *> CastSet;
+
+  //
+  // Do something at the begining
+  //
+  if (1 == MIdx) {
+    for (auto MN : Ctx->Modules) {
+      Module *M = MN.first;
+      for (Module::global_iterator gi = M->global_begin();
+           gi != M->global_end(); ++gi) {
+
+        GlobalVariable *GV = &*gi;
+        if (GV->hasInitializer()) {
+          Ctx->Globals[GV->getGUID()] = GV;
+        }
+      }
+    }
+  }
+
+  //
+  // Iterate and process globals
+  //
+  for (Module::global_iterator gi = M->global_begin(); gi != M->global_end();
+       ++gi) {
+
+    GlobalVariable *GV = &*gi;
+    if (GV->hasInitializer()) {
+
+      Type *ITy = GV->getInitializer()->getType();
+      if (!ITy->isPointerTy() && !isContainerTy(ITy))
+        continue;
+
+      // Ctx->Globals[GV->getGUID()] = GV;
+
+      // Parse the initializer
+      set<Type *> TySet;
+      findTargetTypesInInitializer(GV, M, TySet);
+
+      typeConfineInInitializer(GV);
+
+      // Collect all casts in the global variable
+      findCastsInGV(GV, CastSet);
+    }
+  }
+
+  // Iterate functions and instructions
+  for (Function &F : *M) {
+
+    // Find the parameter of these functions
+
+    // get the source type of the parameters
+
+    // Do not include LLVM intrinsic functions?
+    if (F.isIntrinsic()) {
+      continue;
+    }
+
+    // Collect address-taken functions.
+    // NOTE: declaration functions can also have address taken
+    if (F.hasAddressTaken()) {
+      Ctx->AddressTakenFuncs.insert(&F);
+      size_t FuncHash = funcHash(&F, false);
+      Ctx->sigFuncsMap[FuncHash].insert(&F);
+      StringRef FName = F.getName();
+      // The following functions are not in the analysis scope
+      if (FName.startswith("__x64") || FName.startswith("__ia32") ||
+          FName.startswith("__do_sys")) {
+        OutScopeFuncNames.insert(F.getName().str());
+      }
+    }
+
+    // The following only considers actual functions with body
+    if (F.isDeclaration()) {
+      continue;
+    }
+    ++Ctx->NumFunctions;
+
+    // Collect global function definitions.
+    if (F.hasExternalLinkage()) {
+      Ctx->GlobalFuncMap[F.getGUID()] = &F;
+    }
+
+    // checkMemoryRelatedInsts_MLTA(&F, M);
+    //
+    // MLTA and TyPM
+    //
+    if (ENABLE_MLTA > 1) {
+      typePropInFunction(&F);
+    }
+
+    collectAliasStructPtr(&F);
+    typeConfineInFunction(&F);
+
+    // Collect all casts in the function
+    findCastsInFunction(&F, CastSet);
+
+    // Handle casts
+    processCasts(CastSet, M);
+
+    // Collect all stores against fields of composite types in the
+    // function
+    findStoredTypeIdxInFunction(&F);
+
+    // Collection allocations of critical data structures
+    findTargetAllocInFunction(&F);
+  }
+
+  //
+  // Do something at the end of last module
+  //
+  if (Ctx->Modules.size() == MIdx) {
+
+    if (ENABLE_MLTA > 1) {
+      // Map the declaration functions to actual ones
+      // NOTE: to delete an item, must iterate by reference
+      for (auto &SF : Ctx->sigFuncsMap) {
+        for (auto F : SF.second) {
+          if (!F)
+            continue;
+          if (F->isDeclaration()) {
+            SF.second.erase(F);
+            if (Function *AF = Ctx->GlobalFuncMap[F->getGUID()]) {
+              SF.second.insert(AF);
+            }
+          }
+        }
+      }
+
+      for (auto &TF : typeIdxFuncsMap) {
+        for (auto &IF : TF.second) {
+          for (auto F : IF.second) {
+            if (F->isDeclaration()) {
+              IF.second.erase(F);
+              if (Function *AF = Ctx->GlobalFuncMap[F->getGUID()]) {
+                IF.second.insert(AF);
+              }
+            }
+          }
+        }
+      }
+    }
+
+    MIdx = 0;
+  }
+
+  return false;
+}
+
+// unused code in clean mode
 
 void checkMemoryRelatedInsts(Function *F, Module *M) {
   static int totalMemCopyCalls = 0;
@@ -456,7 +662,7 @@ void checkMemoryRelatedInsts(Function *F, Module *M) {
                 currentVal = srcValue;
                 continue;
               }
-              // Check if it's a GEP instruction
+              // Check if it's a GEP instruction : getfieldtype
               else if (GetElementPtrInst *gepInst =
                            dyn_cast<GetElementPtrInst>(defInst)) {
                 Type *sourceType = gepInst->getSourceElementType();
@@ -657,166 +863,9 @@ void checkMemoryRelatedInsts(Function *F, Module *M) {
   }
 }
 
-bool CallGraphPass::doInitialization(Module *M) {
 
-  OP << "#" << MIdx << " Initializing: " << M->getName() << "\n";
 
-  ++MIdx;
 
-  DLMap[M] = &(M->getDataLayout());
-  Int8PtrTy[M] = Type::getInt8PtrTy(M->getContext());
-  assert(Int8PtrTy[M]);
-  IntPtrTy[M] = DLMap[M]->getIntPtrType(M->getContext());
-
-  set<User *> CastSet;
-
-  //
-  // Do something at the begining
-  //
-  if (1 == MIdx) {
-    for (auto MN : Ctx->Modules) {
-      Module *M = MN.first;
-      for (Module::global_iterator gi = M->global_begin();
-           gi != M->global_end(); ++gi) {
-
-        GlobalVariable *GV = &*gi;
-        if (GV->hasInitializer()) {
-          Ctx->Globals[GV->getGUID()] = GV;
-        }
-      }
-    }
-  }
-
-  //
-  // Iterate and process globals
-  //
-  for (Module::global_iterator gi = M->global_begin(); gi != M->global_end();
-       ++gi) {
-
-    GlobalVariable *GV = &*gi;
-    if (GV->hasInitializer()) {
-
-      Type *ITy = GV->getInitializer()->getType();
-      if (!ITy->isPointerTy() && !isContainerTy(ITy))
-        continue;
-
-      // Ctx->Globals[GV->getGUID()] = GV;
-
-      // Parse the initializer
-      set<Type *> TySet;
-      findTargetTypesInInitializer(GV, M, TySet);
-
-      typeConfineInInitializer(GV);
-
-      // Collect all casts in the global variable
-      findCastsInGV(GV, CastSet);
-    }
-  }
-
-  // Iterate functions and instructions
-  for (Function &F : *M) {
-
-    // Find the parameter of these functions
-
-    // get the source type of the parameters
-
-    // Do not include LLVM intrinsic functions?
-    if (F.isIntrinsic()) {
-      continue;
-    }
-
-    // Collect address-taken functions.
-    // NOTE: declaration functions can also have address taken
-    if (F.hasAddressTaken()) {
-      Ctx->AddressTakenFuncs.insert(&F);
-      size_t FuncHash = funcHash(&F, false);
-      Ctx->sigFuncsMap[FuncHash].insert(&F);
-      StringRef FName = F.getName();
-      // The following functions are not in the analysis scope
-      if (FName.startswith("__x64") || FName.startswith("__ia32") ||
-          FName.startswith("__do_sys")) {
-        OutScopeFuncNames.insert(F.getName().str());
-      }
-    }
-
-    // The following only considers actual functions with body
-    if (F.isDeclaration()) {
-      continue;
-    }
-    ++Ctx->NumFunctions;
-
-    // Collect global function definitions.
-    if (F.hasExternalLinkage()) {
-      Ctx->GlobalFuncMap[F.getGUID()] = &F;
-    }
-
-    checkMemoryRelatedInsts_MLTA(&F, M);
-    //
-    // MLTA and TyPM
-    //
-    if (ENABLE_MLTA > 1) {
-      typePropInFunction(&F);
-    }
-
-    collectAliasStructPtr(&F);
-    typeConfineInFunction(&F);
-
-    // Collect all casts in the function
-    findCastsInFunction(&F, CastSet);
-
-    // Handle casts
-    processCasts(CastSet, M);
-
-    // Collect all stores against fields of composite types in the
-    // function
-    findStoredTypeIdxInFunction(&F);
-
-    // Collection allocations of critical data structures
-    findTargetAllocInFunction(&F);
-  }
-
-  //
-  // Do something at the end of last module
-  //
-  if (Ctx->Modules.size() == MIdx) {
-
-    if (ENABLE_MLTA > 1) {
-      // Map the declaration functions to actual ones
-      // NOTE: to delete an item, must iterate by reference
-      for (auto &SF : Ctx->sigFuncsMap) {
-        for (auto F : SF.second) {
-          if (!F)
-            continue;
-          if (F->isDeclaration()) {
-            SF.second.erase(F);
-            if (Function *AF = Ctx->GlobalFuncMap[F->getGUID()]) {
-              SF.second.insert(AF);
-            }
-          }
-        }
-      }
-
-      for (auto &TF : typeIdxFuncsMap) {
-        for (auto &IF : TF.second) {
-          for (auto F : IF.second) {
-            if (F->isDeclaration()) {
-              IF.second.erase(F);
-              if (Function *AF = Ctx->GlobalFuncMap[F->getGUID()]) {
-                IF.second.insert(AF);
-              }
-            }
-          }
-        }
-      }
-    }
-
-    MIdx = 0;
-  }
-
-  return false;
-}
-
-// unused code in clean mode
 void CallGraphPass::PhaseMLTA(Function *F) {
 
   // Unroll loops
@@ -1077,13 +1126,6 @@ bool CallGraphPass::doModulePass(Module *M) {
             TypesFromModuleGVMap[GMM.first].end());
       }
     }
-#if 0
-			for (auto m : moPropMap)
-				for (auto m1 : m.second)
-					OP<<"@@ dependence "<<m1->getName()
-						<<" ==> "<<m.first.first->getName()
-						<<" HASH: "<<m.first.second<<"\n";
-#endif
   }
 
   //
@@ -1095,71 +1137,72 @@ bool CallGraphPass::doModulePass(Module *M) {
 
     if (F->isDeclaration() || F->isIntrinsic())
       continue;
+    checkMemoryRelatedInsts_MLTA(F, M);
 
-    // Phase 1: Multi-layer type analysis
-    if (AnalysisPhase == 1) {
-      PhaseMLTA(F);
-    } else {
-      // Phase 2-to-n: Modular type analysis
-      // TODO: only iterate over indirect calls
-      PhaseTyPM(F);
-    }
-  }
+    //     // Phase 1: Multi-layer type analysis
+    //     if (AnalysisPhase == 1) {
+    //       PhaseMLTA(F);
+    //     } else {
+    //       // Phase 2-to-n: Modular type analysis
+    //       // TODO: only iterate over indirect calls
+    //       PhaseTyPM(F);
+    //     }
+    //   }
 
-  // Analysis phase control
-  if (Ctx->Modules.size() == MIdx) {
+    //   // Analysis phase control
+    //   if (Ctx->Modules.size() == MIdx) {
 
-    if (AnalysisPhase == 2) {
-      //
-      // Clear no longer useful structures
-      //
-      GVFuncTypesMap.clear();
-      TypesFromModuleGVMap.clear();
-      TypesToModuleGVMap.clear();
-    }
+    //     if (AnalysisPhase == 2) {
+    //       //
+    //       // Clear no longer useful structures
+    //       //
+    //       GVFuncTypesMap.clear();
+    //       TypesFromModuleGVMap.clear();
+    //       TypesToModuleGVMap.clear();
+    //     }
 
-    if (AnalysisPhase >= 2) {
+    //     if (AnalysisPhase >= 2) {
 
-      ResolvedDepModulesMap.clear();
-      bool Iter = true;
-      // Merge the propagation maps
-      moPropMapAll.insert(moPropMap.begin(), moPropMap.end());
-      // Add map one by one to avoid overwritting
-      for (auto m : moPropMapV) {
-        moPropMapAll[m.first].insert(m.second.begin(), m.second.end());
-      }
+    //       ResolvedDepModulesMap.clear();
+    //       bool Iter = true;
+    //       // Merge the propagation maps
+    //       moPropMapAll.insert(moPropMap.begin(), moPropMap.end());
+    //       // Add map one by one to avoid overwritting
+    //       for (auto m : moPropMapV) {
+    //         moPropMapAll[m.first].insert(m.second.begin(), m.second.end());
+    //       }
 
-      // TODO: multi-threading for better performance
+    //       // TODO: multi-threading for better performance
 
-      //
-      // Steps 2 and 3 of TyPM: Collecting depedent modules
-      // and resolving targets within  on dependent modules
-      //
-#ifdef FUNCTION_AS_TARGET_TYPE
-      bool NextIter = resolveFunctionTargets();
-#else // struct as target type
-      bool NextIter = resolveStructTargets();
-#endif
+    //       //
+    //       // Steps 2 and 3 of TyPM: Collecting depedent modules
+    //       // and resolving targets within  on dependent modules
+    //       //
+    // #ifdef FUNCTION_AS_TARGET_TYPE
+    //       bool NextIter = resolveFunctionTargets();
+    // #else // struct as target type
+    //       bool NextIter = resolveStructTargets();
+    // #endif
 
-      if (!NextIter) {
-        // Done with the iteration
-        MIdx = 0;
-        return false;
-      }
+    //       if (!NextIter) {
+    //         // Done with the iteration
+    //         MIdx = 0;
+    //         return false;
+    //       }
 
-      // Reset the map when phase >= 2
-      moPropMapV.clear();
-      moPropMapAll.clear();
-      ParsedModuleTypeICallMap.clear();
-      ParsedModuleTypeDCallMap.clear();
-    }
+    //       // Reset the map when phase >= 2
+    //       moPropMapV.clear();
+    //       moPropMapAll.clear();
+    //       ParsedModuleTypeICallMap.clear();
+    //       ParsedModuleTypeDCallMap.clear();
+    //     }
 
-    ++AnalysisPhase;
-    MIdx = 0;
-    if (AnalysisPhase <= MAX_PHASE_CG) {
-      OP << "\n\n=== Move to phase " << AnalysisPhase << " ===\n\n";
-      return true;
-    }
+    //     ++AnalysisPhase;
+    //     MIdx = 0;
+    //     if (AnalysisPhase <= MAX_PHASE_CG) {
+    //       OP << "\n\n=== Move to phase " << AnalysisPhase << " ===\n\n";
+    //       return true;
+    //     }
   }
 
   return false;
