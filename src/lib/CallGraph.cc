@@ -50,13 +50,10 @@ int CallGraphPass::AnalysisPhase = 1;
 list<typeidx_t> TyChain;
 bool Complete = true;
 
-bool aggresiveCheckIfFptr(Type *srcType, Type *destType){
-  StructType* sty_src=dyn_cast<StructType>(srcType);
-  StructType* sty_dest=dyn_cast<StructType>(destType);
-  if (!sty_src || !sty_dest) {
-    return false;
-  }
-  StructType *sty=(sty_src->getNumElements() > sty_dest->getNumElements())?sty_dest:sty_src;
+
+
+bool aggresiveCheckIfFptr(Type *parType){
+  StructType* sty= dyn_cast<StructType>(parType);
   // Check if the smaller struct has function pointer fields recursively
   std::function<bool(Type*)> hasRecursiveFunctionPointer = [&](Type* ty) -> bool {
     if (!ty) return false;
@@ -341,7 +338,7 @@ void CallGraphPass::checkMemoryRelatedInsts_MLTA(Function *F, Module *M) {
                 continue;
               }
               // condition 2 one of the structs do not have fptr field.
-              if(!aggresiveCheckIfFptr(normalizedSrcType,normalizedDestType)){
+              if(!aggresiveCheckIfFptr(normalizedSrcType) && !aggresiveCheckIfFptr(normalizedDestType)){
                 OP << "⚠️  Exceptional condition: one struct does not have fptr "
                       "field\n";
                 continue;
